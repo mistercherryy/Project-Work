@@ -1,0 +1,230 @@
+
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <ur_rtde/rtde_control_interface.h>
+#include <ur_rtde/rtde_receive_interface.h>
+#include <vector>
+#include "openvr.h"
+#include <math.h>
+
+using namespace ur_rtde;
+
+//Vive Tracker Position getters & constructors
+namespace vtp
+{
+    // Returns indices of valid tracked devices of class @lookForClass
+    void FindTrackedDevicesOfClass(vr::IVRSystem* system, const vr::TrackedDeviceClass& lookForClass, std::vector<vr::TrackedDeviceIndex_t>& validIndices)
+    {
+        for (vr::TrackedDeviceIndex_t idx = 0; idx < vr::k_unMaxTrackedDeviceCount; idx++)
+        {
+            auto trackedDeviceClass = system->GetTrackedDeviceClass(idx);
+            if (trackedDeviceClass == lookForClass)
+            {
+                validIndices.push_back(idx);
+                std::cout << "Found valid device at index " << idx << std::endl;
+            }
+        }
+    }
+    // Returns a std::string of a trackedDevice property
+    std::string GetTrackedPropString(vr::IVRSystem* system, vr::TrackedDeviceIndex_t unDeviceIndex, vr::TrackedDeviceProperty prop)
+    {
+        if (!system)
+            return std::string();
+
+        const uint32_t bufSize = vr::k_unMaxPropertyStringSize;
+        //        char* pchValue = new char[bufSize];
+        std::unique_ptr<char*> pchValue = std::make_unique<char*>(new char[bufSize]);
+        std::string propString = "";
+        vr::TrackedPropertyError pError = vr::TrackedPropertyError::TrackedProp_NotYetAvailable;
+
+        system->GetStringTrackedDeviceProperty(unDeviceIndex, prop, *pchValue.get(), bufSize, &pError);
+
+        if (pError != vr::TrackedPropertyError::TrackedProp_Success)
+        {
+            propString = "Error";
+        }
+        else
+        {
+            propString = std::string(*pchValue.get());
+        }
+        return propString;
+    }
+
+    // +y is up, +x is right, -z is forward, units are meters
+    // According to https://github.com/ValveSoftware/openvr/issues/689 ,
+    // [X1 Y1 Z1 P1]
+    // [X2 Y2 Z2 P2]
+    // [X3 Y3 Z3 P3]
+    // Where P is position vector
+    std::string HmdMatrix34ToString(vr::HmdMatrix34_t& m)
+    {
+        // Returns m.m[col][row] followed by a comma
+        auto mn = [&](auto row, auto col) { return std::to_string(m.m[row][col]) + ","; };
+
+
+        return
+            "[" + mn(0, 0) + mn(0, 1) + mn(0, 2) + mn(0, 3) + "\n" +
+            mn(1, 0) + mn(1, 1) + mn(1, 2) + mn(1, 3) + "\n" +
+            mn(2, 0) + mn(2, 1) + mn(2, 2) + (mn(2, 3)) + "\n" +
+            "0.0,      0.0,       0.0,       1.0]";
+
+    }
+
+    // Returns TrackedDevicePose_t struct of device# trackerIdx
+    vr::TrackedDevicePose_t GetTrackedDevicePose(vr::IVRSystem* system_, vr::TrackedDeviceIndex_t& trackerIdx)
+    {
+        vr::VRControllerState_t state;
+        vr::TrackedDevicePose_t pose;
+        bool gotPose = system_->GetControllerStateWithPose(vr::ETrackingUniverseOrigin::TrackingUniverseStanding, trackerIdx, &state, 1, &pose);
+
+        if (!gotPose)
+        {
+            std::cerr << "Failed to get pose";
+        }
+        return pose;
+    }
+
+    // Prints information about TrackedDevice pose
+    void PrintTrackedDevicePose(vr::TrackedDevicePose_t& pose)
+    {
+       
+
+        bool& poseValid = pose.bPoseIsValid;
+        std::cout << "Pose: ";
+        if (poseValid)
+        {
+            // Print matrix
+
+            
+            /*----from triad.py
+            double yaw = 180 / pi * atan2(mat.m[1][0], mat.m[0][0]);
+            double pitch = 180 / pi*atan2(mat.m[2][0], mat.m[0][0]);
+            double roll = 180 / pi*atan2(mat.m[2][1], mat.m[2][2]);
+            double x = mat.m[0][3];
+            double y = mat.m[1][3];
+            double z = mat.m[2][3]+1.6; */
+
+           
+            //std::vector<double> poses = { x, y, z, yaw, roll, pitch };
+            
+           
+            std::cout << std::endl;
+            std::cout << "Transformation Matrix: \n " << std::endl;
+
+            std::cout << "\n" + vtp::HmdMatrix34ToString(pose.mDeviceToAbsoluteTracking) << std::endl;
+            std::cout << std::endl;
+        }
+        else
+        {
+            std::cout << "Invalid" << std::endl;
+        }
+    }
+
+}
+
+
+//ROBOT CONSTRUCTORS
+// The constructor simply takes the IP address of the Robot
+RTDEControlInterface rtde_control("134.28.124.104");
+RTDEReceiveInterface rtde_receive("134.28.124.104");
+std::vector<double> joint_q = { -0.343, -1.449, 2.122, -3.79, -1.536, 0 };
+std::vector<double> joint_q_two = { -0.327, -0.624, 1.062, -3.079, -1.534, 0.3 };
+std::vector<double> tcp_pose = { -1.169, 0.208, 0.346, 2.7, 1.652, -1.517 };
+
+double pi = 3.141592;
+
+static void Source()
+//int main(int argc, char* argv[]) 
+{
+    using namespace vr;
+
+   
+    //INIT -- Taken from OpenVR sample
+    vr::EVRInitError eError = vr::VRInitError_None;
+    vr::IVRSystem* system_ = vr::VR_Init(&eError, vr::VRApplication_Other);
+    if (eError != vr::VRInitError_None)
+    {
+        system_ = NULL;
+        char buf[1024];
+        sprintf_s(buf, sizeof(buf), "Unable to init VR runtime: %s", vr::VR_GetVRInitErrorAsEnglishDescription(eError));
+        //return false;
+    }
+
+    // Find generic trackers only
+    vr::TrackedDeviceClass lookForClass = TrackedDeviceClass::TrackedDeviceClass_GenericTracker;
+
+    // Store found trackers in vector
+    std::vector<vr::TrackedDeviceIndex_t> genericTrackerIndices;
+    vtp::FindTrackedDevicesOfClass(system_, lookForClass, genericTrackerIndices);
+    if (genericTrackerIndices.empty())
+    {
+        std::cerr << "No tracked devices found!";
+        //return -1;
+    }
+
+    // Loop through trackers and get more info
+    for (auto trackerIdxIt = genericTrackerIndices.begin(); trackerIdxIt != genericTrackerIndices.end(); trackerIdxIt++)
+    {
+        vr::TrackedDeviceIndex_t& trackerIdx = *trackerIdxIt;
+        bool isConnected = system_->IsTrackedDeviceConnected(trackerIdx);
+        std::cout << "Device Index: " << trackerIdx << std::endl;
+        if (isConnected)
+        {
+            // Print property strings
+            auto getPropString = [&](auto desc, auto prop) {
+                return desc + vtp::GetTrackedPropString(system_, trackerIdx, prop) + "\n";
+            };
+            std::cout << "Connected!" << std::endl;
+            std::cout << getPropString("TrackingSystemName: ", Prop_TrackingSystemName_String);
+            std::cout << getPropString("ModelNumber: ", Prop_ModelNumber_String);
+            std::cout << getPropString("SerialNumber: ", Prop_SerialNumber_String);
+
+            rtde_control.moveJ(joint_q, 0.2, 0.4, false);
+           
+            while (rtde_receive.isConnected() && rtde_control.isConnected())
+            {
+                auto pose = vtp::GetTrackedDevicePose(system_, trackerIdx);
+
+                //get necessray pose implementations in here and send them
+                vr::HmdMatrix34_t mat = pose.mDeviceToAbsoluteTracking;
+                //from https://github.com/ValveSoftware/openvr/issues/888
+                double sy = std::sqrt(std::pow(mat.m[0][0], 2) + std::pow(mat.m[0][1], 2));
+                double roll = 180 / pi * atan2(mat.m[1][2], mat.m[2][2]);
+                double pitch = 180 / pi * atan2(mat.m[0][2], sy);
+                double yaw = 180 / pi * atan2(mat.m[0][1], mat.m[0][0]);
+                double x = mat.m[0][3];
+                double y = mat.m[1][3];
+                double z = mat.m[2][3] + 1.6;
+
+                std::vector<double> poses = { x, z, y, yaw, pitch, roll };
+                std::vector<double> sent_poses = { tcp_pose[0]-x, tcp_pose[1]+z, tcp_pose[2]+y, tcp_pose[3] + yaw, tcp_pose[4]+pitch, tcp_pose[5]+roll };
+
+                rtde_control.moveL(sent_poses, 0.1,0.2,false);
+
+                std::cout << "TCP POSE is: " << std::endl;
+                for (const auto& e : rtde_receive.getActualTCPPose())
+                    std::cout << e << " ";
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                std::cout << std::endl;
+
+                // vtp::PrintTrackedDevicePose(pose);
+
+                
+            }
+        }
+        else
+        {
+            std::cout << "Error:Not connected!" << std::endl;
+        }
+        std::cout << "--------------" << std::endl;
+    }
+
+    // SHUTDOWN
+    vr::VR_Shutdown();
+    system_ = NULL;
+    //return 0;
+
+}
+
+
